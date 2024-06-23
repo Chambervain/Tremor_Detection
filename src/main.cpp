@@ -1,15 +1,6 @@
 #include <mbed.h>
+#include "arm_math.h"
 
-// =================================================
-// * Recitation 5: SPI and Gyroscope *
-// =================================================
-
-// TODOs:
-// [1] Get started with an SPI object instance and connect to the Gyroscope!
-// [2] Read the XYZ axis from the Gyroscope and Visualize on the Teleplot. 
-// [3] Fetching Data from the sensor via Polling vs Interrupt ?
-
-// Define control register addresses and their configurations
 #define CTRL_REG1 0x20
 #define CTRL_REG1_CONFIG 0b01'10'1'1'1'1
 #define CTRL_REG4 0x23
@@ -17,18 +8,26 @@
 #define SPI_FLAG 1
 #define OUT_X_L 0x28
 
+#define FILTER_SIZE 10  // Number of samples for the moving average filter
+#define SCALING_FACTOR (17.5f * 0.0174532925199432957692236907684886f / 1000.0f)
+#define ALPHA 0.1  // Smoothing factor for EMA
+
 EventFlags flags;
 
-void spi_cb(int event)
-{
+void spi_cb(int event) {
     flags.set(SPI_FLAG);
 }
 
-#define SCALING_FACTOR (17.5f * 0.0174532925199432957692236907684886f / 1000.0f)
+// Function to compute the moving average
+float compute_moving_average(float *buffer, int size) {
+    float sum = 0.0f;
+    for (int i = 0; i < size; i++) {
+        sum += buffer[i];
+    }
+    return sum / size;
+}
 
-
-int main()
-{
+int main() {
     // Initialize the SPI object with specific pins.
     SPI spi(PF_9, PF_8, PF_7, PC_1, use_gpio_ssel);
 
@@ -51,11 +50,12 @@ int main()
     spi.transfer(write_buf, 2, read_buf, 2, spi_cb);
     flags.wait_all(SPI_FLAG);
 
-    while(1){
+    // Buffers for moving average filter
+    float y_filter_buffer[FILTER_SIZE] = {0}, z_filter_buffer[FILTER_SIZE] = {0};
+    int filter_index = 0;
+    float ema_gx = 0.0f;
 
-        uint16_t raw_gx, raw_gy, raw_gz;
-        float gx, gy, gz;
-
+    while(1) {
         // Prepare to read the gyroscope values starting from OUT_X_L
         write_buf[0] = OUT_X_L | 0x80 | 0x40;
 
@@ -64,26 +64,28 @@ int main()
         flags.wait_all(SPI_FLAG);
 
         // Convert the received data into 16-bit integers for each axis
-        raw_gx = (((uint16_t)read_buf[2]) << 8) | ((uint16_t) read_buf[1]);
-        raw_gy = (((uint16_t)read_buf[4]) << 8) | ((uint16_t) read_buf[3]);
-        raw_gz = (((uint16_t)read_buf[6]) << 8) | ((uint16_t) read_buf[5]);
+        uint16_t raw_gx = (((uint16_t)read_buf[2]) << 8) | ((uint16_t) read_buf[1]);
+        uint16_t raw_gy = (((uint16_t)read_buf[4]) << 8) | ((uint16_t) read_buf[3]);
+        uint16_t raw_gz = (((uint16_t)read_buf[6]) << 8) | ((uint16_t) read_buf[5]);
+        float gx = ((float) raw_gx) * SCALING_FACTOR;
+        float gy = ((float) raw_gy) * SCALING_FACTOR;
+        float gz = ((float) raw_gz) * SCALING_FACTOR;
 
-        // Print the raw values for debugging 
-        printf("RAW -> \t\tgx: %d \t gy: %d \t gz: %d \t\n", raw_gx, raw_gy, raw_gz);
+        // Update the EMA for the x-axis
+        ema_gx = ALPHA * gx + (1 - ALPHA) * ema_gx;
 
-            printf(">x_axis: %d|g \n", raw_gx);
-            printf(">y_axis: %d|g \n", raw_gy);
-            printf(">z_axis: %d|g \n", raw_gz);
+        // Update the filter buffer for y and z axes
+        y_filter_buffer[filter_index] = gy;
+        z_filter_buffer[filter_index] = gz;
+        filter_index = (filter_index + 1) % FILTER_SIZE;
 
-        // Convert raw data to actual values using a scaling factor
-        gx = ((float) raw_gx) * SCALING_FACTOR;
-        gy = ((float) raw_gy) * SCALING_FACTOR;
-        gz = ((float) raw_gz) * SCALING_FACTOR;
+        // Compute the smoothed values using the moving average filter for y and z axes
+        float smooth_gy = compute_moving_average(y_filter_buffer, FILTER_SIZE);
+        float smooth_gz = compute_moving_average(z_filter_buffer, FILTER_SIZE);
 
-        // Print the actual values
-        printf("Actual -> \t\tgx: %4.5f \t gy: %4.5f \t gz: %4.5f \t\n", gx, gy, gz);
+        // Print the smoothed values
+        printf("Smoothed -> \t\tgx: %4.5f \t gy: %4.5f \t gz: %4.5f \t\n", (-1)*ema_gx+11, (-1)*smooth_gy+20, (-1)*smooth_gz+20);
 
         thread_sleep_for(100);
     }
-
 }
