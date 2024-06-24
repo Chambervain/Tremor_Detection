@@ -1,30 +1,67 @@
 #include <mbed.h>
-#include "arm_math.h"
+#include <cmath>
 
 #define CTRL_REG1 0x20
-#define CTRL_REG1_CONFIG 0b01'10'1'1'1'1
+#define CTRL_REG1_CONFIG 0b01101111
 #define CTRL_REG4 0x23
-#define CTRL_REG4_CONFIG 0b0'0'01'0'00'0
+#define CTRL_REG4_CONFIG 0b00010000
 #define SPI_FLAG 1
 #define OUT_X_L 0x28
 
-#define FILTER_SIZE 10  // Number of samples for the moving average filter
-#define SCALING_FACTOR (17.5f * 0.0174532925199432957692236907684886f / 1000.0f)
-#define ALPHA 0.1  // Smoothing factor for EMA
+#define SAMPLES 256  // Number of samples for FFT (must be a power of 2)
+#define FFT_SIZE (SAMPLES / 2)  // FFT size is half the number of samples
 
 EventFlags flags;
 
-void spi_cb(int event) {
+void spi_cb(int event)
+{
     flags.set(SPI_FLAG);
 }
 
-// Function to compute the moving average
-float compute_moving_average(float *buffer, int size) {
-    float sum = 0.0f;
-    for (int i = 0; i < size; i++) {
-        sum += buffer[i];
+#define SCALING_FACTOR (17.5f * 0.0174532925199432957692236907684886f / 1000.0f)
+
+// Function to perform bit reversal on an array
+void bit_reversal(float *real, float *imag, int n) {
+    int j = 0;
+    for (int i = 0; i < n; ++i) {
+        if (i < j) {
+            std::swap(real[i], real[j]);
+            std::swap(imag[i], imag[j]);
+        }
+        int m = n >> 1;
+        while (m >= 1 && j >= m) {
+            j -= m;
+            m >>= 1;
+        }
+        j += m;
     }
-    return sum / size;
+}
+
+// Function to perform the Cooley-Tukey FFT
+void fft(float *real, float *imag, int n) {
+    bit_reversal(real, imag, n);
+    for (int s = 1; s <= log2(n); ++s) {
+        int m = 1 << s;
+        float wm_real = cos(2 * M_PI / m);
+        float wm_imag = -sin(2 * M_PI / m);
+        for (int k = 0; k < n; k += m) {
+            float w_real = 1.0;
+            float w_imag = 0.0;
+            for (int j = 0; j < m / 2; ++j) {
+                int t = k + j;
+                int u = k + j + m / 2;
+                float t_real = w_real * real[u] - w_imag * imag[u];
+                float t_imag = w_real * imag[u] + w_imag * real[u];
+                real[u] = real[t] - t_real;
+                imag[u] = imag[t] - t_imag;
+                real[t] += t_real;
+                imag[t] += t_imag;
+                float w_temp = w_real * wm_real - w_imag * wm_imag;
+                w_imag = w_real * wm_imag + w_imag * wm_real;
+                w_real = w_temp;
+            }
+        }
+    }
 }
 
 int main() {
@@ -32,7 +69,7 @@ int main() {
     SPI spi(PF_9, PF_8, PF_7, PC_1, use_gpio_ssel);
 
     // Buffers for sending and receiving data over SPI.
-    uint8_t write_buf[32], read_buf[32];
+    int8_t write_buf[32], read_buf[32];
 
     // Configure SPI format and frequency.
     spi.format(8, 3);
@@ -50,12 +87,16 @@ int main() {
     spi.transfer(write_buf, 2, read_buf, 2, spi_cb);
     flags.wait_all(SPI_FLAG);
 
-    // Buffers for moving average filter
-    float y_filter_buffer[FILTER_SIZE] = {0}, z_filter_buffer[FILTER_SIZE] = {0};
-    int filter_index = 0;
-    float ema_gx = 0.0f;
+    // FFT buffers and variables
+    float input_buffer[SAMPLES];
+    float imag_buffer[SAMPLES] = {0};  // Initialize imaginary part to zero
+
+    int sample_index = 0;
 
     while(1) {
+        int16_t raw_gx, raw_gy, raw_gz;
+        float gx, gy, gz;
+
         // Prepare to read the gyroscope values starting from OUT_X_L
         write_buf[0] = OUT_X_L | 0x80 | 0x40;
 
@@ -64,27 +105,44 @@ int main() {
         flags.wait_all(SPI_FLAG);
 
         // Convert the received data into 16-bit integers for each axis
-        uint16_t raw_gx = (((uint16_t)read_buf[2]) << 8) | ((uint16_t) read_buf[1]);
-        uint16_t raw_gy = (((uint16_t)read_buf[4]) << 8) | ((uint16_t) read_buf[3]);
-        uint16_t raw_gz = (((uint16_t)read_buf[6]) << 8) | ((uint16_t) read_buf[5]);
-        float gx = ((float) raw_gx) * SCALING_FACTOR;
-        float gy = ((float) raw_gy) * SCALING_FACTOR;
-        float gz = ((float) raw_gz) * SCALING_FACTOR;
+        raw_gx = (((int16_t)read_buf[2]) << 8) | ((int16_t) read_buf[1]);
+        raw_gy = (((int16_t)read_buf[4]) << 8) | ((int16_t) read_buf[3]);
+        raw_gz = (((int16_t)read_buf[6]) << 8) | ((int16_t) read_buf[5]);
 
-        // Update the EMA for the x-axis
-        ema_gx = ALPHA * gx + (1 - ALPHA) * ema_gx;
+        // Print the raw values for debugging
+        printf("RAW -> \t\tgx: %d \t gy: %d \t gz: %d \t\n", raw_gx, raw_gy, raw_gz);
 
-        // Update the filter buffer for y and z axes
-        y_filter_buffer[filter_index] = gy;
-        z_filter_buffer[filter_index] = gz;
-        filter_index = (filter_index + 1) % FILTER_SIZE;
+        // Convert raw data to actual values using a scaling factor
+        gx = ((float) raw_gx) * SCALING_FACTOR;
+        gy = ((float) raw_gy) * SCALING_FACTOR;
+        gz = ((float) raw_gz) * SCALING_FACTOR;
 
-        // Compute the smoothed values using the moving average filter for y and z axes
-        float smooth_gy = compute_moving_average(y_filter_buffer, FILTER_SIZE);
-        float smooth_gz = compute_moving_average(z_filter_buffer, FILTER_SIZE);
+        // Print the actual values
+        printf("Actual -> \t\tgx: %4.5f \t gy: %4.5f \t gz: %4.5f \t\n", gx, gy, gz);
 
-        // Print the smoothed values
-        printf("Smoothed -> \t\tgx: %4.5f \t gy: %4.5f \t gz: %4.5f \t\n", (-1)*ema_gx+11, (-1)*smooth_gy+20, (-1)*smooth_gz+20);
+        // Collect data for FFT
+        input_buffer[sample_index++] = gx;  // Use gx as an example, you can also use gy or gz
+
+        if (sample_index >= SAMPLES) {
+            // Reset sample index for next batch of data
+            sample_index = 0;
+
+            // Perform the FFT
+            fft(input_buffer, imag_buffer, SAMPLES);
+
+            // Calculate the magnitude of the FFT output
+            float fft_output[FFT_SIZE];
+            for (int i = 0; i < FFT_SIZE; i++) {
+                fft_output[i] = sqrtf(input_buffer[i] * input_buffer[i] + imag_buffer[i] * imag_buffer[i]);
+            }
+
+            // Print the FFT output for debugging
+            printf("FFT Output:\n");
+            for (int i = 0; i < FFT_SIZE; i++) {
+                printf("%4.5f ", fft_output[i]);
+            }
+            printf("\n");
+        }
 
         thread_sleep_for(100);
     }
