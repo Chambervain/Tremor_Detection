@@ -7,18 +7,21 @@
 #define CTRL_REG4_CONFIG 0b00010000
 #define SPI_FLAG 1
 #define OUT_X_L 0x28
-
-#define SAMPLES 256  // Number of samples for FFT (must be a power of 2)
-#define FFT_SIZE (SAMPLES / 2)  // FFT size is half the number of samples
+#define SAMPLES 64
+#define FFT_SIZE (SAMPLES / 2)
 
 EventFlags flags;
 
-void spi_cb(int event)
-{
+void spi_cb(int event) {
     flags.set(SPI_FLAG);
 }
 
 #define SCALING_FACTOR (17.5f * 0.0174532925199432957692236907684886f / 1000.0f)
+#define TREMOR_THRESHOLD 0.1f
+#define TREMOR_FREQ_START 3    // 3 Hz
+#define TREMOR_FREQ_END 6      // 6 Hz
+
+DigitalOut led(LED1);  // Initialize the LED
 
 // Function to perform bit reversal on an array
 void bit_reversal(float *real, float *imag, int n) {
@@ -64,6 +67,30 @@ void fft(float *real, float *imag, int n) {
     }
 }
 
+// Function to detect tremors based on FFT output
+bool detect_tremor(float *fft_output, int size, float &tremor_intensity) {
+    tremor_intensity = 0.0f;
+    bool tremor_detected = false;
+
+    for (int i = TREMOR_FREQ_START; i <= TREMOR_FREQ_END; i++) {
+        if (fft_output[i] > TREMOR_THRESHOLD) {
+            tremor_detected = true;
+            tremor_intensity += fft_output[i];
+        }
+    }
+
+    if(tremor_intensity < 9.0 || tremor_intensity == false){
+        return false;
+    }
+    // printf("TESTING INTERMEDIATE RESULTS:  Intensity = %4.5f\n", tremor_intensity);
+    tremor_intensity = tremor_intensity - 9.0;
+    if(tremor_intensity >= 100){
+        tremor_intensity = 100;
+    }
+
+    return tremor_detected;
+}
+
 int main() {
     // Initialize the SPI object with specific pins.
     SPI spi(PF_9, PF_8, PF_7, PC_1, use_gpio_ssel);
@@ -89,15 +116,12 @@ int main() {
 
     // FFT buffers and variables
     float input_buffer[SAMPLES];
-    float imag_buffer[SAMPLES] = {0};  // Initialize imaginary part to zero
-
+    float imag_buffer[SAMPLES];
     int sample_index = 0;
 
     while(1) {
         int16_t raw_gx, raw_gy, raw_gz;
         float gx, gy, gz;
-
-        // Prepare to read the gyroscope values starting from OUT_X_L
         write_buf[0] = OUT_X_L | 0x80 | 0x40;
 
         // Perform the SPI transfer to read 6 bytes of data (for x, y, and z axes)
@@ -109,23 +133,21 @@ int main() {
         raw_gy = (((int16_t)read_buf[4]) << 8) | ((int16_t) read_buf[3]);
         raw_gz = (((int16_t)read_buf[6]) << 8) | ((int16_t) read_buf[5]);
 
-        // Print the raw values for debugging
-        printf("RAW -> \t\tgx: %d \t gy: %d \t gz: %d \t\n", raw_gx, raw_gy, raw_gz);
+        // Print the raw data
+        // printf("RAW data values-> \t\tgx: %d \t gy: %d \t gz: %d \t\n", raw_gx, raw_gy, raw_gz);
 
         // Convert raw data to actual values using a scaling factor
         gx = ((float) raw_gx) * SCALING_FACTOR;
         gy = ((float) raw_gy) * SCALING_FACTOR;
         gz = ((float) raw_gz) * SCALING_FACTOR;
 
-        // Print the actual values
-        printf("Actual -> \t\tgx: %4.5f \t gy: %4.5f \t gz: %4.5f \t\n", gx, gy, gz);
+        // Print the actual velocity values
+        printf("Velocity Values -> \t\tgx: %4.5f \t gy: %4.5f \t gz: %4.5f \t\n", gx, gy, gz);
 
-        // Collect data for FFT
-        input_buffer[sample_index++] = gx;  // Use gx as an example, you can also use gy or gz
-
+        input_buffer[sample_index++] = gx;
         if (sample_index >= SAMPLES) {
-            // Reset sample index for next batch of data
             sample_index = 0;
+            memset(imag_buffer, 0, sizeof(imag_buffer));
 
             // Perform the FFT
             fft(input_buffer, imag_buffer, SAMPLES);
@@ -136,12 +158,25 @@ int main() {
                 fft_output[i] = sqrtf(input_buffer[i] * input_buffer[i] + imag_buffer[i] * imag_buffer[i]);
             }
 
-            // Print the FFT output for debugging
+            // Print the FFT output
             printf("FFT Output:\n");
             for (int i = 0; i < FFT_SIZE; i++) {
                 printf("%4.5f ", fft_output[i]);
             }
-            printf("\n");
+            printf("\n\n");
+
+            // Detect tremors
+            float tremor_intensity;
+            if (detect_tremor(fft_output, FFT_SIZE, tremor_intensity)) {
+                printf("Tremor detected!\n");
+                printf("Tremor Intensity: %d\n\n", static_cast<int>(ceil(tremor_intensity)));
+                // Turn on the led
+                led = 1;
+            } else {
+                printf("No tremor detected.\n\n");
+                // Turn off the led
+                led = 0;
+            }
         }
 
         thread_sleep_for(100);
