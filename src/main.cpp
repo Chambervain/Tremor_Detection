@@ -1,27 +1,68 @@
-#include <mbed.h>
-#include <cmath>
+// Demo video on Youtube: https://www.youtube.com/watch?v=vDDn2Coj7iM
 
+#include <mbed.h>            // Include the main mbed library for hardware interaction.
+#include <cmath>             // Include the cmath library for mathematical operations.
+#include "drivers/LCD_DISCO_F429ZI.h" // Include the driver for the Discovery board's LCD.
+#include "arm_math.h"        // Include the CMSIS ARM Math library for optimized math operations.
+
+// Gyroscope control registers and configuration constants.
 #define CTRL_REG1 0x20
-#define CTRL_REG1_CONFIG 0b01101111
+#define CTRL_REG1_CONFIG 0b01101111   // Configuration for gyroscope activation and data rate.
 #define CTRL_REG4 0x23
-#define CTRL_REG4_CONFIG 0b00010000
-#define SPI_FLAG 1
-#define OUT_X_L 0x28
-#define SAMPLES 64
-#define FFT_SIZE (SAMPLES / 2)
+#define CTRL_REG4_CONFIG 0b00010000   // Configuration for gyroscope sensitivity and scale.
+#define SPI_FLAG 1                    // Flag for SPI event handling.
+#define OUT_X_L 0x28                  // Address of the lower byte of the X-axis data output.
+#define SAMPLES 64                    // Number of samples per FFT computation.
+#define FFT_SIZE (SAMPLES / 2)        // Size of the FFT array.
 
 EventFlags flags;
 
+// SPI callback function to set flags after SPI operations.
 void spi_cb(int event) {
     flags.set(SPI_FLAG);
 }
 
 #define SCALING_FACTOR (17.5f * 0.0174532925199432957692236907684886f / 1000.0f)
-#define TREMOR_THRESHOLD 0.1f
-#define TREMOR_FREQ_START 3    // 3 Hz
-#define TREMOR_FREQ_END 6      // 6 Hz
+#define TREMOR_THRESHOLD 0.1f         // Threshold for tremor detection in the FFT output.
+#define TREMOR_FREQ_START 3           // Lower frequency bound for tremor detection (3Hz).
+#define TREMOR_FREQ_END 6             // Upper frequency bound for tremor detection (6Hz).
 
-DigitalOut led(LED1);  // Initialize the LED
+DigitalOut led(LED1);                 // Digital output for LED indication.
+LCD_DISCO_F429ZI lcd;                 // LCD object for display operations.
+
+// Function to display tremor status on the LCD
+void displayTremorStatus(const char* status, float intensity = 0.0f) {
+    lcd.Clear(LCD_COLOR_BLACK);
+    lcd.SetTextColor(LCD_COLOR_WHITE);
+    lcd.SetBackColor(LCD_COLOR_BLACK);
+    lcd.SetFont(&Font16);
+
+    if (strcmp(status, "Tremor detected!") == 0) {
+        lcd.DisplayStringAt(0, LINE(5), (uint8_t *)"Tremor detected!", CENTER_MODE);
+        char buf[32];
+        sprintf(buf, "Intensity: %d", static_cast<int>(ceil(intensity)));
+        
+        lcd.DisplayStringAt(0, LINE(6), (uint8_t *)buf, CENTER_MODE);
+    } else {
+        lcd.DisplayStringAt(0, LINE(5), (uint8_t *)status, CENTER_MODE);
+    }
+}
+
+// Function to display gyro data on the LCD
+void displayGyroData(float gx, float gy, float gz) {
+    lcd.Clear(LCD_COLOR_BLACK);
+    lcd.SetTextColor(LCD_COLOR_WHITE);
+    lcd.SetBackColor(LCD_COLOR_BLACK);
+    lcd.SetFont(&Font24);
+
+    char buf[32];
+    sprintf(buf, "X: %.2f", gx);
+    lcd.DisplayStringAt(0, LINE(0), (uint8_t *)buf, CENTER_MODE);
+    sprintf(buf, "Y: %.2f", gy);
+    lcd.DisplayStringAt(0, LINE(2), (uint8_t *)buf, CENTER_MODE);
+    sprintf(buf, "Z: %.2f", gz);
+    lcd.DisplayStringAt(0, LINE(4), (uint8_t *)buf, CENTER_MODE);
+}
 
 // Function to perform bit reversal on an array
 void bit_reversal(float *real, float *imag, int n) {
@@ -124,7 +165,7 @@ int main() {
         float gx, gy, gz;
         write_buf[0] = OUT_X_L | 0x80 | 0x40;
 
-        // Perform the SPI transfer to read 6 bytes of data (for x, y, and z axes)
+        // Perform the SPI transfer to read 6 bytes of data for x, y, and z axis
         spi.transfer(write_buf, 7, read_buf, 7, spi_cb);
         flags.wait_all(SPI_FLAG);
 
@@ -133,9 +174,6 @@ int main() {
         raw_gy = (((int16_t)read_buf[4]) << 8) | ((int16_t) read_buf[3]);
         raw_gz = (((int16_t)read_buf[6]) << 8) | ((int16_t) read_buf[5]);
 
-        // Print the raw data
-        // printf("RAW data values-> \t\tgx: %d \t gy: %d \t gz: %d \t\n", raw_gx, raw_gy, raw_gz);
-
         // Convert raw data to actual values using a scaling factor
         gx = ((float) raw_gx) * SCALING_FACTOR;
         gy = ((float) raw_gy) * SCALING_FACTOR;
@@ -143,8 +181,10 @@ int main() {
 
         // Print the actual velocity values
         printf("Velocity Values -> \t\tgx: %4.5f \t gy: %4.5f \t gz: %4.5f \t\n", gx, gy, gz);
-
         input_buffer[sample_index++] = gx;
+        // displayGyroData(gx, gy, gz);
+
+        // When buffer is full, perform FFT and analyze the results.
         if (sample_index >= SAMPLES) {
             sample_index = 0;
             memset(imag_buffer, 0, sizeof(imag_buffer));
@@ -170,15 +210,19 @@ int main() {
             if (detect_tremor(fft_output, FFT_SIZE, tremor_intensity)) {
                 printf("Tremor detected!\n");
                 printf("Tremor Intensity: %d\n\n", static_cast<int>(ceil(tremor_intensity)));
+                // If tremor is detected, display the status and intensity on the LCD.
+                displayTremorStatus("Tremor detected!", tremor_intensity);
                 // Turn on the led
                 led = 1;
             } else {
                 printf("No tremor detected.\n\n");
+                // If no tremor is detected, inform the user via LCD.
+                displayTremorStatus("No tremor detected...");
                 // Turn off the led
                 led = 0;
             }
         }
 
-        thread_sleep_for(100);
+        thread_sleep_for(100);  // Sleep to throttle data processing rate.
     }
 }
